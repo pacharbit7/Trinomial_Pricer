@@ -1,0 +1,678 @@
+import numpy as np
+from datetime import datetime
+import time
+import matplotlib.pyplot as plt
+import networkx as nx
+import math
+from scipy.stats import norm
+import pandas as pd
+
+
+# Parameters Classes
+
+# Params associated to the market
+class Market:
+    
+    def __init__(self, r:float, vol:float, S0:float, div:float = 0, div_date:str ='2099-01-01'):
+        self.r = r
+        self.vol = vol
+        self.S0 = S0
+        self.div = div
+        self.div_date = div_date
+
+# Classes associated for params related to the contract
+class Option:
+    
+    def __init__(self, Strike:float, Maturity:str, Exercise:str = 'Call', Type:str = "european"):
+        self.type = Type
+        self.exercise = Exercise
+        self.strike = Strike
+        self.mat = Maturity
+        
+#params relaetd to the modeling choice
+class Model:
+    
+    def __init__(self, Pricing_date:str, Nb_steps:int, pruning:str = 'ON', pruning_val:float = 1e-9):
+        
+        self.t0 = Pricing_date
+        self.N = Nb_steps
+        self.pruning = pruning
+        self.pruning_val = pruning_val
+        
+        
+# Cette classe va servir à instancier des objets Tree qui auront comme input des objets de Market, Option et Model.
+# Ces objets sont les ensembles de paramètres qui vont venir définir l'arbre (pour market et model) et caracteriser les conditions de Pricing (pour Option)
+ 
+class Tree:
+
+    def __init__(self, market:Market, option:Option, model:Model):
+        
+        self.K = option.strike
+        self.r = market.r
+        
+        if not isinstance(model.t0, datetime):
+            self.Pricing_date = datetime.strptime(model.t0, '%Y-%m-%d')
+        else:
+            self.Pricing_date = model.t0
+        if not isinstance(option.mat, datetime):
+            self.T = datetime.strptime(option.mat, '%Y-%m-%d')
+        else:
+            self.T = option.mat
+        #local variable used to calculate the time step
+        days_difference = (self.T - self.Pricing_date).days
+        self.N = model.N
+        self.dt = days_difference / (self.N * 365)
+        self.S0 = market.S0
+        self.vol = market.vol
+        self.alpha = np.exp(self.vol * np.sqrt(3 * self.dt))
+        self.div = market.div
+        self.root = Node(self.S0, self, 0)
+        
+        if market.div_date:
+            # Convert the str date in a date_time object
+            if not isinstance(market.div_date, datetime):
+                self.div_date = datetime.strptime(market.div_date, '%Y-%m-%d')
+            else:
+                self.div_date = market.div_date
+            days_to_dividend = (self.div_date - self.Pricing_date).days
+            days_per_step = days_difference / self.N  # Ici, nous utilisons days_difference
+            self.div_step = int(days_to_dividend / days_per_step)
+        else:
+            self.div_step = None
+
+        self.option_type = option.type
+        self.option = option.exercise
+        self.Pruning = model.pruning
+        self.pruning_val = model.pruning_val
+        self.probas_without_div()
+        self.build_tree()
+
+#This method is the main of the code along with build_blocks, it will perform the construction of the tree, first by creating the "truncs" Node
+#and then by building up and down for each layers
+    def build_tree(self):
+        
+        n = self.root
+        n.build_blocks()
+        
+        for i in range(1, self.N):
+
+            n = n.next_mid
+#on remarque que la méthode correct_forward n'est appelé que sur les noeuds du "tronc" car le forward ne baisse du dividene que sur ces noeuds là
+            n.correct_forward()
+            n_up = n
+            n_down = n
+            n.build_blocks()
+# l'idée ici est de construire le tronc l'abre "colonne" par "colonne" (boucle for), en appelant buildblocks sur chaque noeud de chaque colonne, d'abord sur les 
+#noeuds du tronc, puis sur ceux en dessous et au dessus (boucles while)
+            while n_up.Node_up is not None:
+                n_up = n_up.Node_up
+                n_up.build_blocks()  
+
+            while n_down.Node_down is not None:
+                n_down = n_down.Node_down
+                n_down.build_blocks()
+
+#Cette méthode renvoie le prix de la racine de l'abre, c'est à dire le prix de l'option
+    def option_price(self) -> float:
+
+        return self.root.price()
+    
+#This method is used to imrove the performence of the code since for the non-dividend steps, the probas of up/down is the same for each node
+    def probas_without_div(self):
+
+        self.p_down = ((np.exp(self.vol**2 * self.dt) - 1) /
+            ((1-self.alpha) * (self.alpha**(-2) - 1)))
+
+        self.p_up = self.p_down / self.alpha
+
+        self.p_mid = 1 - self.p_down - self.p_up
+
+
+#Cette Classe permet d'instancier des objets Noeuds, elle prend comme argument un spot, un arbre (puisque elle va reutiliser l'abre auqel le neoud appartient),
+# un "level" qui représente la "colonne" de l'arbre à laquelle le noeud est rattaché, et la probabilité d'atteindre ce noeud en partant de la racine
+#cette probabilité est initilisée à 1 pour tous les noeuds car la probabilité de la racine est 1 par définition
+
+class Node:
+
+    def __init__(self, spot:float, tree:Tree, level:int, cumulative_prob:float = 1):
+        self.spot = spot
+        self.tree = tree
+        self.level = level
+        self.forward = self.spot * np.exp(self.tree.dt * self.tree.r)
+        self.next_up = None
+        self.next_mid = None
+        self.next_down = None
+        self.price_val = None
+        self.Node_up = None
+        self.Node_down = None
+        self.div = None
+        self.cumulative_prob = cumulative_prob
+        
+#Cette fonction permet de verifier que le next mid de "self" est effectivement le neoud le plus proche de self.forward
+#Si ce n'est pas le cas, alors la fonction coorect_link vient corriger cela
+#elle renvoie un booléen valant 1 (True) si le forward du neoud est bien compris entre le spot du next_mid +/- le spot du next_up/ celui du next_down
+
+    def is_close(self) -> bool:
+
+        return self.spot * ((1+1/self.tree.alpha)/2) < self.forward < self.spot * ((1+self.tree.alpha)/2)
+
+#Méthode qui vient corriger le next_mid du noeud sur lequel elle est appelée. Si is_close est vraie alors elle retourne "self.next_mid" c'est à dire qu'elle ne fait rien
+#Sinon elle vient corriger le next_mid tant que is_close est faux, ainsi, le next_mid de chaque noeud sera bien le noeud le plus "proche" du forward
+    def correct_link(self):
+        if self.next_mid.is_close():
+            return self.next_mid
+
+        elif self.forward > self.next_mid.spot:
+            while not self.is_close():
+                self.next_mid.get_up()
+                #self.next_down = self.next_mid
+                self.next_mid = self.next_mid.Node_up
+                # self.next_mid.get_up()
+                #self.next_up = self.next_mid.Node_up
+                return self.next_mid
+        else:
+            while not self.is_close():
+                self.next_mid.get_down()
+                self.next_mid = self.next_mid.Node_down
+
+                return self.next_mid
+
+#méthode centrale dans la construction de l'arbre, avec build_tree
+#Cette méthode est utilisée non seulement pour construire/lier (si ils existent déjà) les noeuds enfants de chaque noeuds, mais aussi pou mettre à jour les reaching probas
+# ces cumulative_prob sont utilisés par le pruning
+
+#Cumulative probas: multiplication sur un même chemin et addition des probas de chaque chemin menant à un noeud à la fin
+    def build_blocks(self):
+    
+#calculation of the cumulative probas of each node (the risk neutral probas of reaching a specified node)
+        next_up_prob = self.cumulative_prob * self.tree.p_up
+        next_mid_prob = self.cumulative_prob * self.tree.p_mid
+        next_down_prob = self.cumulative_prob * self.tree.p_down
+        
+        if self.tree.Pruning == 'ON':
+            if next_mid_prob >= self.tree.pruning_val:
+                if self.next_mid is None:
+                    self.next_mid = Node(self.forward, self.tree, self.level+1, next_mid_prob)
+# si un next_mid est déjà lié au noeud, alors la proba cumulée de next_mid est augmentée de sa proba cumulée actuelle         
+                elif self.next_mid:
+                    self.next_mid.cumulative_prob += next_mid_prob
+        else:
+            if self.next_mid is None:
+                self.next_mid = Node(self.forward, self.tree, self.level+1, next_mid_prob)
+                
+        if self.tree.Pruning == 'ON':
+            if next_up_prob >= self.tree.pruning_val:
+                if self.next_up is None:
+                    self.next_mid.get_up()
+                    self.next_up = self.next_mid.Node_up
+                    self.next_up.cumulative_prob = next_up_prob  
+                elif self.next_up:
+                    self.next_up.cumulative_prob += next_up_prob
+        else:
+#cas sans pruning, next_mid appel get_up qui permet de monter de creer le noeud au dessus dans la même "colonne"
+            if self.next_up is None:
+                self.next_mid.get_up()
+                self.next_up = self.next_mid.Node_up
+                
+        if self.tree.Pruning == 'ON':
+            if next_down_prob >= self.tree.pruning_val:
+                if self.next_down is None:
+                    self.next_mid.get_down()
+                    self.next_down = self.next_mid.Node_down
+                    self.next_down.cumulative_prob = next_down_prob  # Initialisez la probabilité pour le nouveau nœud
+                elif self.next_down:
+                    self.next_down.cumulative_prob += next_down_prob
+        else:
+             if self.next_down is None:
+                 self.next_mid.get_down()
+                 self.next_down = self.next_mid.Node_down
+#Ici build_blocks vient lier les noeuds entre eux, c'est ce qui permet de ne pas avoir creer des noeuds déjà existants 
+        if self.Node_down:
+            self.Node_down.next_up = self.next_mid
+            self.Node_down.next_mid = self.next_down
+ 
+        if self.Node_up:
+            self.Node_up.next_down = self.next_mid
+            self.Node_up.next_mid = self.next_up
+            
+# Si l'etape actuelle n'est pas celle où le div tombe, alors on appel les probas calculés dans le constructeur de tree
+#sinon correct_link va venir corriger les liens si nécéssaire puis appliquer les probas calculées.
+        if self.level != self.tree.div_step:
+            self.p_up = self.tree.p_up
+            self.p_mid = self.tree.p_mid
+            self.p_down = self.tree.p_down
+        else:
+            self.correct_link()
+            self.probas()
+
+#in fine build_blocks est une methode de Node qui vient consruire 3 noeauds enfants à chaque Node sur lequel elle est appelée,
+#Attention, elle ne construit 3 noeuds que si le noeud sur lequel elle est appelée est un noeud du tronc, sinon elle va n'en construire qu'un
+# soit up soit down, et lier els autres à des noeuds déjà crées, ceci dans une optique d'optimisation de code.
+#enfin, si le niveau du noeud est la periode où le div tombe, on appel correct_link et probas (la formule genrale),
+#sinon on appel que les probas calcuéls une fois pour toute lors de la construction de tree
+          
+#Vient diminuer le forward du montant du dividende si jamais le resultat est superieur à 0 
+#Cette méthode n'est appelée que sur les noeuds du troncs (dans build_tree), elle permet donc de diminuer les spots des noeuds de la colonne où tombe le div
+    def correct_forward(self):
+
+        if (self.level == self.tree.div_step) and ((self.forward - self.tree.div) > 0):
+            self.forward -= self.tree.div
+
+#les deux méthodes suivantes vont venir creer un noeud directement au dessus/dessous du noeud à partir duquel elles sont appelées
+#elles sont utilisées dans 
+    def get_up(self):
+        self.Node_up = Node(self.spot * self.tree.alpha, self.tree, self.level)
+
+    def get_down(self):
+        self.Node_down = Node(self.spot / self.tree.alpha,
+                              self.tree, self.level)
+#Cette méthode reprend la formule générale (sans simplification où forward = next_mid.spot) et sert à calculer les probas des noeuds de l'étape du dividende
+    def probas(self):
+        variance = (self.spot**2 * np.exp(2*self.tree.r * self.tree.dt)
+                    * (np.exp((self.tree.vol ** 2) * self.tree.dt) - 1))
+        esp = self.spot * np.exp(self.tree.dt * self.tree.r) - self.tree.div
+        num = (self.next_mid.spot ** (-2) * (variance + esp ** 2)
+               - 1 - (self.tree.alpha + 1) * (self.next_mid.spot ** (-1) * esp - 1))
+        deno = (1-self.tree.alpha) * (self.tree.alpha ** (-2) - 1)
+
+        self.p_down = num / deno
+
+        self.p_up = ((self.next_mid.spot ** (-1) * esp - 1 - (self.tree.alpha ** (-1) - 1) *  self.p_down)
+                     / (self.tree.alpha - 1))
+
+        self.p_mid = 1 - self.p_down - self.p_up
+
+#Méthode de Pricing récursive, elle va venir calculer le prix de chaque noeud en partant de la racine et en arrivant à la condition finale (payoff)
+    def price(self) -> float:
+
+        if self.price_val is not None:
+            return self.price_val
+    
+        if self.level == self.tree.N:
+            if self.tree.option == 'Call':
+                self.price_val = max(0, self.spot - self.tree.K)
+            else:  # 'Put'
+                self.price_val = max(0, self.tree.K - self.spot)
+        else:
+            next_up_price = self.next_up.price() if self.next_up is not None else 0
+            next_mid_price = self.next_mid.price() if self.next_mid is not None else 0
+            next_down_price = self.next_down.price() if self.next_down is not None else 0
+            
+            continuation_value = np.exp(-self.tree.r * self.tree.dt) * (self.p_up * next_up_price + 
+                                                                          self.p_mid * next_mid_price + 
+                                                                          self.p_down * next_down_price)
+            
+            if self.tree.option_type == 'american':
+                if self.tree.option == 'Call':
+                    exercise_value = max(0, self.spot - self.tree.K)
+                else:  # 'Put'
+                    exercise_value = max(0, self.tree.K - self.spot)
+                self.price_val = max(exercise_value, continuation_value)
+            else:  # 'european'
+                self.price_val = continuation_value
+    
+        return self.price_val
+    
+############################# Exemple d'utilisation:
+    
+option = Option(101, "2024-07-01")
+market = Market(0.02, 0.25, 100, 3, '2024-03-01')
+model = Model("2023-09-01", 1000, pruning_val = 10e-10)
+
+start_time = time.time()
+t = Tree(market, option, model)
+
+print(t.option_price())
+
+end_time = time.time()
+elapsed_time = end_time - start_time
+print(f"Temps de calcul: {elapsed_time:.2f} secondes.")
+
+#Classe pour calculer les grecs, un objet de cette classe doit-être instanciée avec un objet de Tree comme input
+class greeks:
+    
+    def __init__(self, t:Tree):
+        
+        self.t = t
+        self.S0 = self.t.root.spot
+        self.t_up = None
+        self.t_down = None
+        
+#ici on vient instancier des objets de Market, Option et Model à partir des attributs de t
+        self.market = Market(t.r, t.vol, t.S0, t.div, t.div_date)
+        self.option = Option(t.K, t.T, t.option, t.option_type)
+        self.model = Model(t.Pricing_date, t.N)
+        
+#le dS est les méthodes delta et gamma, delta renvoie la valeur du delta de l'option
+    def delta(self, dS:float) -> float: 
+        
+        self.dS = dS
+        
+        market_up = self.market
+        market_up.S0 = self.market.S0 + dS
+        
+        
+        market_down = Market(self.t.r, self.t.vol, self.t.S0 - self.dS, self.t.div, self.t.div_date)
+        market_up = Market(self.t.r, self.t.vol, self.t.S0 + self.dS, self.t.div, self.t.div_date)
+        
+        
+        self.t_up = Tree(market_up, self.option, self.model)
+        self.t_down = Tree(market_down,  self.option, self.model)
+        
+        return (self.t_up.option_price() - self.t_down.option_price()) / (2 * dS)
+    
+#renvoei la valeur du gamma de l'option
+    def gamma(self) -> float:
+        
+        return (self.t_up.option_price() - 2*self.t.option_price() + self.t_down.option_price()) / (self.dS**2)
+    
+#renvoei la valeur du vegga, attention: la vol est par défaut un input en decimal (0.25 pour 25%) donc dsigma doit-être de la même échelle
+#sinon t_sig_down aura une vol négative (impossible)
+    def vega(self, dsigma:float) -> float:
+        
+        market_up = Market(self.t.r, self.t.vol + dsigma, self.t.S0, self.t.div, self.t.div_date)
+        
+        market_down = Market(self.t.r, self.t.vol - dsigma, self.t.S0, self.t.div, self.t.div_date)
+        
+        t_sig_up = Tree(market_up, option, model)
+        t_sig_down = Tree(market_down, option, model)
+        
+        return (t_sig_up.option_price() - t_sig_down.option_price()) / (2*dsigma * 100)
+    
+############################# Exemple d'utilisation de la classe Greeks:
+    
+option_greeks = Option(101, "2024-07-01")
+market_greeks = Market(0.02, 0.25, 100, 3, '2024-03-01')
+model_greeks = Model("2023-09-01", 10, pruning_val = 10e-10)
+
+t_greeks = Tree(market_greeks, option_greeks, model_greeks)
+
+g = greeks(t_greeks)
+g.delta(3)
+g.gamma()
+g.vega(0.01) 
+
+    
+# Cette classe est utiliséé pour determiner le prix d'une option européenne sans dividende (elle pourrait-être amélioré pour incorporer la possibilité d'un dividende yield)
+# Elle sera utilisée pour des comparaisons avec nos resultats dans les cas où c'est possible
+class BlackScholes:
+    
+    def __init__(self, K:float, r:float, t0:str, T:str, S0:float, sigma:float, option : str='Call'):
+        self.K = K  # Prix d'exercice
+        self.r = r  # Taux d'intérêt sans risque
+        if not isinstance(t0, datetime):
+            self.t0 = datetime.strptime(t0, '%Y-%m-%d')
+        else:
+            self.t0 = t0
+
+        if not isinstance(T, datetime):
+            self.T = datetime.strptime(T, '%Y-%m-%d')
+        else:
+            self.T = T
+
+        self.S0 = S0  # Prix du sous-jacent au temps t0
+        self.sigma = sigma  # Volatilité du sous-jacent
+        self.option = option  # Type d'option ('Call' ou 'Put')
+    
+    def time_to_maturity(self) -> float:
+        """Retourne le temps restant jusqu'à l'échéance en années."""
+        return (self.T - self.t0).days / 365.0
+
+    def d1(self) -> float:
+        """
+        Calcule la valeur de d1 dans la formule de Black-Scholes.
+        """
+        tau = self.time_to_maturity()
+        return (math.log(self.S0 / self.K) + (self.r + (self.sigma ** 2) / 2) * tau) / (self.sigma * math.sqrt(tau))
+    
+    def d2(self) -> float:
+        """
+        Calcule la valeur de d2 dans la formule de Black-Scholes.
+        """
+        tau = self.time_to_maturity()
+        return self.d1() - self.sigma * math.sqrt(tau)
+    
+    def price(self) -> float:
+        """
+        Calcule le prix de l'option en utilisant la formule de Black-Scholes.
+        """
+        tau = self.time_to_maturity()
+        if self.option == 'Call':
+            return self.S0 * norm.cdf(self.d1()) - self.K * math.exp(-self.r * tau) * norm.cdf(self.d2())
+        elif self.option == 'Put':
+            return self.K * math.exp(-self.r * tau) * norm.cdf(-self.d2()) - self.S0 * norm.cdf(-self.d1())
+        else:
+            raise ValueError("Option type not recognized. Please use 'Call' or 'Put'.")
+     
+# Cette fonction a pour but de verifier que le dS utilsié pour le delta/gamma n'est pas trop petit, le gamma étant une dérivée seconde, il est instable et sensible au bruit
+# lorsque la discrétisation est trop faible
+def gamma_bs(V : BlackScholes) -> float:
+    d1 = (np.log(V.S0 / V.K) + (V.r + 0.5 * V.sigma**2) * (V.time_to_maturity())) / (V.sigma * np.sqrt(V.time_to_maturity()))
+    gamma = norm.pdf(d1) / (V.S0 * V.sigma * np.sqrt(V.time_to_maturity()))
+    return gamma
+
+#####################################################################
+#####################################################################
+### Exemple d'utilisation de la classe BlackScholes
+
+bs = BlackScholes(101, 0.02, "2023-09-01", "2024-07-01", 100, 0.25)
+print(bs.price())
+
+#####################################################################
+#####################################################################
+### Visualisation de l'arbre
+def plot_tree(tree:Tree):
+    G = nx.DiGraph()
+    pos = {} # dictionnaire pour stocker la position de chaque noeuds, la position sur les x dépend du "level" de chauqe noeud, pour les y elle dépend de leur spot
+    edge_labels = {}  # Pour stocker les probabilités
+
+    def traverse(node:Node):
+        if node is not None:
+            G.add_node(node, spot=f"{node.spot:.2f}", price=f"{node.price():.2f}")
+            pos[node] = (node.level, node.spot)
+            
+            if node.next_up:
+                G.add_edge(node, node.next_up, probability=node.p_up)
+                edge_labels[(node, node.next_up)] = f"{node.p_up:.2f}"
+                traverse(node.next_up)
+            if node.next_mid:
+                G.add_edge(node, node.next_mid, probability=node.p_mid)
+                edge_labels[(node, node.next_mid)] = f"{node.p_mid:.2f}"
+                traverse(node.next_mid)
+            if node.next_down:
+                G.add_edge(node, node.next_down, probability=node.p_down)
+                edge_labels[(node, node.next_down)] = f"{node.p_down:.2f}"
+                traverse(node.next_down)
+
+    traverse(tree.root)
+
+    labels = {(node[0]): f"S:{node[1]['spot']}\nP:{node[1]['price']}" for node in G.nodes(data=True)}
+
+    plt.figure(figsize=(12, 12))
+    nx.draw(G, pos=pos, labels=labels, with_labels=True, node_size=1000, node_color="skyblue", font_size=8)
+    nx.draw_networkx_edge_labels(G, pos, edge_labels=edge_labels, font_size=8)
+    plt.title("Visualisation de l'Arbre Trinomial avec Probabilités")
+    plt.show()
+
+#PLot, attention le plot ne fonctionne pas pour un abre avec trop de pas, 
+#nous recommandons 10 pour une bonne visualtion avec un temps de calcul acceptable
+option_plot_tree = Option(101, "2024-07-01")
+market_plot_tree = Market(0.1, 0.25, 100, 3, '2024-03-01')
+model_plot_tree = Model("2023-09-01", 10, pruning_val = 10e-10)
+
+
+start_time = time.time()
+t_plot_tree = Tree(market_plot_tree, option_plot_tree, model_plot_tree)
+
+plot_tree(t_plot_tree)
+
+end_time = time.time()
+elapsed_time = end_time - start_time
+print(f"Temps de calcul: {elapsed_time:.2f} secondes.")
+
+
+#####################################################################
+#####################################################################
+### Boucle sur la profondeur de l'arbre
+
+option_convergence = Option(110, "2024-07-01")
+market_convergence = Market(0.02, 0.25, 100)
+
+diff_dict = {}
+i = 20
+bs = BlackScholes(110, 0.02, "2023-09-01", "2024-07-01", 100, 0.25)
+
+while i < 2000:
+    model_convergence = Model("2023-09-01", i, pruning="Off", pruning_val = 10e-11)
+    t_convergence = Tree(market_convergence, option_convergence, model_convergence)
+    diff = (t_convergence.option_price() - bs.price()) * i
+    diff_dict[i] = diff
+    i += 20
+
+# Tracer le graphique
+plt.figure(figsize=(10,6))
+plt.plot(list(diff_dict.keys()), list(diff_dict.values()), marker='o')
+plt.title("Différence de prix en fonction de la profondeur de l'arbre")
+plt.xlabel("Profondeur de l'arbre (i)")
+plt.ylabel("Différence de prix")
+plt.grid(True)
+plt.show()
+
+#####################################################################
+#####################################################################
+### Boucle sur les Strike
+
+market_convergence_strike = Market(0.02, 0.40, 100, 0, '2024-03-01')
+model_convergence_strike = Model("2023-09-01", 10)
+
+strike_dict = {}
+k = 80
+
+while k < 120:
+    option_convergence_strike = Option(k, "2024-07-01")
+    t = Tree(market_convergence_strike, option_convergence_strike, model_convergence_strike)
+    bs = BlackScholes(k, 0.02, "2023-09-01", "2024-07-01", 100, 0.40)
+    diff = (t.option_price() - bs.price())
+    strike_dict[k] = diff
+    k += 1
+
+# Tracer le graphique
+plt.figure(figsize=(10,6))
+plt.plot(list(strike_dict.keys()), list(strike_dict.values()), marker='o')
+plt.title("Différence de prix en fonction du strike")
+plt.xlabel("strike (k)")
+plt.ylabel("Différence de prix")
+plt.grid(True)
+plt.show()
+
+
+#####################################################################
+#####################################################################
+### Boucle sur delta et gamma 
+
+option_greeks = Option(101, "2024-07-01")
+market_greeks = Market(0.02, 0.25, 100, 3, '2024-03-01')
+model_greeks = Model("2023-09-01", 10, pruning_val = 10e-10)
+
+t_greeks = Tree(market_greeks, option_greeks, model_greeks)
+      
+deltas = []
+gammas = []
+S = []
+
+for s in range(80,120):
+    market = Market(0.02, 0.25, s, 3, '2024-03-01')
+    option = Option(101, "2024-07-01")
+    model = Model("2023-09-01", 1000)
+    
+    t = Tree(market, option, model)
+    S.append(s)
+    g = greeks(t)
+    g1 = g.delta(0.5)
+    deltas.append(g1)
+    g2 = g.gamma()
+    gammas.append(g2)
+    
+##### plot deltas
+plt.figure(figsize=(10,6))
+plt.plot(S, deltas, marker='o')
+plt.title("deltas fonction of moneyness")
+plt.xlabel("underlyings")
+plt.ylabel("deltas")
+plt.grid(True)
+plt.show()
+
+##### plot gammas
+plt.figure(figsize=(10,6))
+plt.plot(S, gammas, marker='o')
+plt.title("gammas fonction of moneyness")
+plt.xlabel("underlyings")
+plt.ylabel("gammas")
+plt.grid(True)
+plt.show()
+
+ 
+
+## plot gamma_bs as a function of S0
+Gamma_bs = []
+spot = []
+for i in range(80,120):
+    
+    bs = BlackScholes(101, 0.02, "2023-09-01", "2024-07-01", i, 0.25)
+    gammabs = gamma_bs(bs)
+    Gamma_bs.append(gammabs)
+    spot.append(i)
+    
+plt.figure(figsize=(10,6))
+plt.plot(spot, Gamma_bs, marker='o')
+plt.title("gammas fonction of moneyness")
+plt.xlabel("underlyings")
+plt.ylabel("gammas")
+plt.grid(True)
+plt.show()
+
+
+#####################################################################       Zone de calcul      ##################################################################### 
+#####################################################################                           #####################################################################
+
+
+option = Option(101, "2024-07-01")
+market = Market(0.02, 0.25, 100, 3, '2024-03-01')
+model = Model("2023-09-01", 10, pruning_val = 10e-10)
+
+start_time = time.time()
+t = Tree(market, option, model)
+
+print(t.option_price())
+
+end_time = time.time()
+elapsed_time = end_time - start_time
+print(f"Temps de calcul: {elapsed_time:.2f} secondes.")
+
+#### Code pour obtenir le tableau 1 du mémo
+
+option = Option(101, "2024-07-01")
+market = Market(0.02, 0.25, 100, 3, '2024-03-01')
+
+
+resultats = []
+
+
+for nb_pas in range(100, 2100,100):  
+    model = Model("2023-09-01", nb_pas, pruning_val = 10e-10)
+    
+    start_time = time.time()
+    t = Tree(market, option, model)
+    prix = t.option_price()
+    end_time = time.time()
+
+    elapsed_time = end_time - start_time
+
+    
+    resultats.append({"Nombre de pas": nb_pas, "Temps d'exécution": elapsed_time, "Prix": prix})
+
+
+df_resultats = pd.DataFrame(resultats)
+
+
+print(df_resultats)
